@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, Request, Body
 from fastapi.responses import Response
 from contextlib import asynccontextmanager
 from elasticsearch import Elasticsearch
-import open_clip
+import clip
 import torch
 
 from PIL import Image
@@ -28,7 +28,7 @@ app = FastAPI(lifespan=lifespan)
 # Load CLIP model
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # https://github.com/openai/CLIP
-model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+model, preprocess = clip.load("ViT-B/32", device=device)
 model = model.to(device)
 
 # Connect to elastic search

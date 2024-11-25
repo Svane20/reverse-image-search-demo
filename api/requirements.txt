@@ -3,4 +3,4 @@ uvicorn[standard]
 python-multipart
 elasticsearch
 open-clip-torch
-torch
+clip @ git+https://github.com/openai/CLIP.git
