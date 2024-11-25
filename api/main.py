@@ -179,7 +179,7 @@ async def query_images(request: Request, job: TextQuery = Body(...), top_k: int 
     query_text = job.query_text
 
     # Generate text embedding
-    tokenized_text = open_clip.tokenize([query_text]).to(device)
+    tokenized_text = clip.tokenize([query_text]).to(device)
 
     with torch.inference_mode():
         query_embedding = model.encode_text(tokenized_text).cpu().numpy().flatten()
