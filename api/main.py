@@ -19,12 +19,12 @@ ELASTIC_SEARCH_INDEX = "image_text_similarity"
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    if es.indices.exists(index=ELASTIC_SEARCH_INDEX):
-        es.indices.delete(index=ELASTIC_SEARCH_INDEX)
+    # if es.indices.exists(index=ELASTIC_SEARCH_INDEX):
+    #     es.indices.delete(index=ELASTIC_SEARCH_INDEX)
     create_index(ELASTIC_SEARCH_INDEX)
 
-    mapping = es.indices.get_mapping(index=ELASTIC_SEARCH_INDEX)
-    print(f"INFO:     Mapping for index '{ELASTIC_SEARCH_INDEX}': {mapping['image_text_similarity']['mappings']}")
+    # mapping = es.indices.get_mapping(index=ELASTIC_SEARCH_INDEX)
+    # print(f"INFO:     Mapping for index '{ELASTIC_SEARCH_INDEX}': {mapping['image_text_similarity']['mappings']}")
 
     yield
 
@@ -63,8 +63,8 @@ def create_index(index_name: str) -> None:
                     },
                     "phash": {
                         "type": "dense_vector",
-                        "dims": 64,
                         "element_type": "bit",
+                        # "dims": 64, # Will not work as expected
                         "similarity": "l2_norm"
                     }
                 }
@@ -147,7 +147,6 @@ async def index_image(file: UploadFile):
     embedding = extract_clip_embedding(image_bytes)
     thumbnail = generate_thumbnail(image_bytes)
     phash = generate_phash_as_bit_array(image)
-    print(f"PHash: {phash}, Length: {len(phash)}")
 
     if not (isinstance(phash, list) and len(phash) == 64 and all(bit in [0, 1] for bit in phash)):
         raise ValueError(f"Invalid phash format. Expected 64 bits, got {len(phash)} bits: {phash}")
@@ -159,16 +158,15 @@ async def index_image(file: UploadFile):
         "embedding": embedding.tolist(),
         "phash": phash
     }
-    print(f"Document Phash: {doc['phash']}, length: {len(doc['phash'])}")
 
     try:
-        res = es.index(index=ELASTIC_SEARCH_INDEX, body=doc)
+        res = es.index(index=ELASTIC_SEARCH_INDEX, document=doc)
         return {"result": res}
     except Exception as e:
         print(f"Error: {e}")
         if hasattr(e, 'info'):
             print(f"Elasticsearch response: {e.info}")
-        raise e
+        raise
 
 
 @app.post("/search")
@@ -184,13 +182,11 @@ async def search_image(file: UploadFile, request: Request, top_k: int = 5):
     Returns:
         dict: Matching results with scores, image paths and thumbnails.
     """
-    image_bytes = await file.read()
+    base_url = request.base_url
 
     # Extract image embedding
+    image_bytes = await file.read()
     query_embedding = extract_clip_embedding(image_bytes)
-
-    # Convert embedding to list
-    query_embedding = query_embedding.tolist()
 
     # PHash search
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
@@ -198,28 +194,33 @@ async def search_image(file: UploadFile, request: Request, top_k: int = 5):
     p_response = search_by_phash(phash_bits, top_k)
     p_results = [
         {
-            "score": hit["_score"]
+            "image_path": hit["_source"]["image_path"],
+            "thumbnail": f"{base_url}thumbnail/{hit['_source']['image_path']}",
+            "score": hit["_score"],
+            "search_type": "phash"
         }
         for hit in p_response["hits"]["hits"]
     ]
-    print(f"Phash results: {p_results}")
 
     # KNN search
-    response = _knn_search_images(query_embedding, top_k)
-
-    base_url = request.base_url
-    results = [
+    response = _knn_search_images(query_embedding.tolist(), top_k)
+    knn_results = [
         {
             "image_path": hit["_source"]["image_path"],
             "thumbnail": f"{base_url}thumbnail/{hit['_source']['image_path']}",
-            "score": hit["_score"]
+            "score": hit["_score"],
+            "search_type": "knn"
         }
         for hit in response["hits"]["hits"]
     ]
 
+    # Combine and sort the results
+    combined_results = p_results + knn_results
+    sorted_combined_results = sorted(combined_results, key=lambda x: x["score"], reverse=True)
+
     return {
-        "total_hits": response["hits"]["total"]["value"],
-        "results": results
+        "total_hits": len(sorted_combined_results),
+        "results": sorted_combined_results
     }
 
 
