@@ -10,7 +10,7 @@ from io import BytesIO
 import os
 import numpy as np
 import base64
-from typing import Tuple, Dict
+from typing import Tuple
 from pydantic import BaseModel
 
 ELASTIC_SEARCH_INDEX = "image_text_similarity"
