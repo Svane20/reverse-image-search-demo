@@ -12,13 +12,19 @@ import numpy as np
 import base64
 from typing import Tuple
 from pydantic import BaseModel
+import imagehash
 
 ELASTIC_SEARCH_INDEX = "image_text_similarity"
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if es.indices.exists(index=ELASTIC_SEARCH_INDEX):
+        es.indices.delete(index=ELASTIC_SEARCH_INDEX)
     create_index(ELASTIC_SEARCH_INDEX)
+
+    mapping = es.indices.get_mapping(index=ELASTIC_SEARCH_INDEX)
+    print(f"INFO:     Mapping for index '{ELASTIC_SEARCH_INDEX}': {mapping['image_text_similarity']['mappings']}")
 
     yield
 
@@ -50,7 +56,17 @@ def create_index(index_name: str) -> None:
                 "properties": {
                     "image_path": {"type": "text"},
                     "thumbnail": {"type": "text"},
-                    "embedding": {"type": "dense_vector", "dims": 512}  # Adjust dimensions as per the model
+                    "embedding": {
+                        "type": "dense_vector",
+                        "dims": 512,  # Adjust dimensions as per the model,
+                        "similarity": "cosine"
+                    },
+                    "phash": {
+                        "type": "dense_vector",
+                        "dims": 64,
+                        "element_type": "bit",
+                        "similarity": "l2_norm"
+                    }
                 }
             }
         }
@@ -105,23 +121,54 @@ def generate_thumbnail(image_bytes: bytes, size: Tuple[int, int] = (128, 128)) -
     return thumbnail_base64
 
 
+def generate_phash_as_bit_array(image: Image) -> list:
+    """
+    Generate a 64-bit perceptual hash bit vector.
+    """
+    phash = imagehash.phash(image)  # Generate phash as a hex string
+    pHash_bytes = bytes.fromhex(str(phash))  # Convert hex to bytes
+    if len(pHash_bytes) != 8:  # Each byte represents 8 bits
+        raise ValueError(f"Invalid pHash length. Expected 8 bytes, got {len(pHash_bytes)}.")
+
+    bit_vector = []
+    for byte in pHash_bytes:
+        bit_vector.extend([int(bit) for bit in bin(byte)[2:].zfill(8)])  # Convert to binary
+    if len(bit_vector) != 64:
+        raise ValueError(f"Invalid bit vector length. Expected 64, got {len(bit_vector)}.")
+    return bit_vector
+
+
 @app.post("/index")
 async def index_image(file: UploadFile):
     image_bytes = await file.read()
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
 
     # Extract embedding and generate thumbnail
     embedding = extract_clip_embedding(image_bytes)
     thumbnail = generate_thumbnail(image_bytes)
+    phash = generate_phash_as_bit_array(image)
+    print(f"PHash: {phash}, Length: {len(phash)}")
+
+    if not (isinstance(phash, list) and len(phash) == 64 and all(bit in [0, 1] for bit in phash)):
+        raise ValueError(f"Invalid phash format. Expected 64 bits, got {len(phash)} bits: {phash}")
 
     # Use the correct index name
     doc = {
         "image_path": file.filename,
         "thumbnail": thumbnail,
-        "embedding": embedding.tolist()
+        "embedding": embedding.tolist(),
+        "phash": phash
     }
-    res = es.index(index=ELASTIC_SEARCH_INDEX, body=doc)
+    print(f"Document Phash: {doc['phash']}, length: {len(doc['phash'])}")
 
-    return {"result": res}
+    try:
+        res = es.index(index=ELASTIC_SEARCH_INDEX, body=doc)
+        return {"result": res}
+    except Exception as e:
+        print(f"Error: {e}")
+        if hasattr(e, 'info'):
+            print(f"Elasticsearch response: {e.info}")
+        raise e
 
 
 @app.post("/search")
@@ -144,6 +191,18 @@ async def search_image(file: UploadFile, request: Request, top_k: int = 5):
 
     # Convert embedding to list
     query_embedding = query_embedding.tolist()
+
+    # PHash search
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    phash_bits = generate_phash_as_bit_array(image)
+    p_response = search_by_phash(phash_bits, top_k)
+    p_results = [
+        {
+            "score": hit["_score"]
+        }
+        for hit in p_response["hits"]["hits"]
+    ]
+    print(f"Phash results: {p_results}")
 
     # KNN search
     response = _knn_search_images(query_embedding, top_k)
@@ -188,7 +247,6 @@ async def query_images(request: Request, job: TextQuery = Body(...), top_k: int 
 
     with torch.inference_mode():
         query_embedding = model.encode_text(tokenized_text).cpu().numpy().flatten()
-
 
     # KNN search
     response = _knn_search_images(query_embedding.tolist(), top_k)
@@ -244,6 +302,22 @@ async def get_thumbnail(image_path: str):
 
     # Return the thumbnail as an image response
     return Response(content=thumbnail_binary, media_type="image/jpeg")
+
+
+def search_by_phash(phash_bits: list, top_k: int = 5):
+    query = {
+        "field": "phash",
+        "query_vector": phash_bits,
+        "k": top_k,
+        "num_candidates": 10  # Adjust for performance vs. accuracy
+    }
+
+    response = es.knn_search(
+        index=ELASTIC_SEARCH_INDEX,
+        knn=query,
+        source=True
+    )
+    return response
 
 
 def _knn_search_images(dense_vector: list, knn: int):
