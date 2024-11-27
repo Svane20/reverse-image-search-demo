@@ -10,7 +10,7 @@ from io import BytesIO
 import os
 import numpy as np
 import base64
-from typing import Tuple
+from typing import Tuple, Dict
 from pydantic import BaseModel
 
 ELASTIC_SEARCH_INDEX = "image_text_similarity"
@@ -126,35 +126,40 @@ async def index_image(file: UploadFile):
 
 @app.post("/search")
 async def search_image(file: UploadFile, request: Request, top_k: int = 5):
+    """
+    Search for similar images using the input image.
+
+    Args:
+        file (UploadFile): The input image file to search for similar images.
+        request (Request): FastAPI request object to construct the thumbnail URL.
+        top_k (int): Number of top results to return.
+
+    Returns:
+        dict: Matching results with scores, image paths and thumbnails.
+    """
     image_bytes = await file.read()
+
+    # Extract image embedding
     query_embedding = extract_clip_embedding(image_bytes)
-    query = {
-        "size": top_k,
-        "query": {
-            "script_score": {
-                "query": {"match_all": {}},
-                "script": {
-                    "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
-                    "params": {"query_vector": query_embedding.tolist()}
-                }
-            }
-        }
-    }
-    response = es.search(index=ELASTIC_SEARCH_INDEX, body=query)
+
+    # Convert embedding to list
+    query_embedding = query_embedding.tolist()
+
+    # KNN search
+    response = _knn_search_images(query_embedding, top_k)
 
     base_url = request.base_url
-
     results = [
         {
             "image_path": hit["_source"]["image_path"],
             "thumbnail": f"{base_url}thumbnail/{hit['_source']['image_path']}",
-            "score": hit["_score"] - 1.0
+            "score": hit["_score"]
         }
         for hit in response["hits"]["hits"]
     ]
 
     return {
-        "total_hits": len(results),
+        "total_hits": response["hits"]["total"]["value"],
         "results": results
     }
 
@@ -184,20 +189,9 @@ async def query_images(request: Request, job: TextQuery = Body(...), top_k: int 
     with torch.inference_mode():
         query_embedding = model.encode_text(tokenized_text).cpu().numpy().flatten()
 
-    # Construct Elasticsearch query
-    query_body = {
-        "size": top_k,
-        "query": {
-            "script_score": {
-                "query": {"match_all": {}},
-                "script": {
-                    "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
-                    "params": {"query_vector": query_embedding.tolist()}
-                }
-            }
-        }
-    }
-    response = es.search(index=ELASTIC_SEARCH_INDEX, body=query_body)
+
+    # KNN search
+    response = _knn_search_images(query_embedding.tolist(), top_k)
 
     # Generate results with thumbnails
     base_url = request.base_url
@@ -205,7 +199,7 @@ async def query_images(request: Request, job: TextQuery = Body(...), top_k: int 
         {
             "image_path": hit["_source"]["image_path"],
             "thumbnail": f"{base_url}thumbnail/{hit['_source']['image_path']}",
-            "score": hit["_score"] - 1.0
+            "score": hit["_score"]
         }
         for hit in response["hits"]["hits"]
     ]
@@ -250,3 +244,32 @@ async def get_thumbnail(image_path: str):
 
     # Return the thumbnail as an image response
     return Response(content=thumbnail_binary, media_type="image/jpeg")
+
+
+def _knn_search_images(dense_vector: list, knn: int):
+    """
+    Perform KNN search using the given dense vector.
+
+    Args:
+        dense_vector (list): Dense vector to search for similar images.
+        knn (int): Number of nearest neighbors to return.
+
+    Returns:
+        dict: Elasticsearch response with matching images
+    """
+    source_fields = ["image_path", "thumbnail"]
+    query = {
+        "field": "embedding",
+        "query_vector": dense_vector,
+        "k": knn,
+        "num_candidates": 10
+    }
+
+    response = es.search(
+        index=ELASTIC_SEARCH_INDEX,
+        fields=source_fields,
+        knn=query,
+        source=True
+    )
+
+    return response
